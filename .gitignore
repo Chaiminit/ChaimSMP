@@ -5,7 +5,7 @@ crash-reports/
 
 # Java
 *.jar
-!paper.jar
+# paper.jar excluded - downloaded by start script
 
 # Runtime files
 *.pid
