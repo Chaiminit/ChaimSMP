@@ -200,12 +200,22 @@ backup_and_push() {
     git commit -m "自动备份: $DATE - Minecraft服务器数据"
 
     if [ $? -eq 0 ]; then
-        # 推送到远程仓库
-        git push origin master
+        # 推送到远程仓库（使用当前用户的SSH密钥）
+        local ORIGINAL_USER="${SUDO_USER:-$USER}"
+        local ORIGINAL_HOME=$(eval echo ~$ORIGINAL_USER)
+
+        if [ -n "$SUDO_USER" ]; then
+            # 如果是sudo运行，使用原用户的SSH密钥
+            sudo -u "$SUDO_USER" -H git push origin master
+        else
+            git push origin master
+        fi
+
         if [ $? -eq 0 ]; then
             log_info "[$TIMESTAMP] 备份成功推送到远程仓库"
         else
             log_error "[$TIMESTAMP] 推送到远程仓库失败"
+            log_info "请确保已将SSH公钥添加到GitHub: $ORIGINAL_HOME/.ssh/id_rsa.pub"
         fi
     else
         log_warn "[$TIMESTAMP] 没有需要提交的变更"
