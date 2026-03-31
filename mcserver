@@ -1,0 +1,382 @@
+#!/bin/bash
+
+# Minecraft Server 管理脚本
+# 通用入口，支持启动、停止、重启、备份、查看状态等功能
+
+# 脚本元数据
+readonly SCRIPT_NAME="mcserver"
+readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# 配置变量（可自定义）
+SERVER_NAME="chaimsmp"
+SERVER_PORT="25565"
+DATA_DIR="./data"
+COMPOSE_FILE="docker-compose.yml"
+
+# 颜色定义
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[1;33m'
+readonly BLUE='\033[0;34m'
+readonly CYAN='\033[0;36m'
+readonly NC='\033[0m'
+
+# 日志函数
+log_info() { echo -e "${GREEN}[INFO]${NC} $1" >&2; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1" >&2; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+log_highlight() { echo -e "${CYAN}$1${NC}" >&2; }
+log_debug() { [[ "$VERBOSE" == "true" ]] && echo -e "${BLUE}[DEBUG]${NC} $1" >&2; }
+
+# 显示帮助信息
+show_help() {
+    cat << EOF
+Minecraft Server 管理脚本 v${SCRIPT_VERSION}
+
+用法: ${SCRIPT_NAME} [命令] [选项]
+
+命令:
+  start       启动服务器（默认）
+  stop        停止服务器
+  restart     重启服务器
+  status      查看服务器状态
+  logs        查看服务器日志
+  backup [消息] 立即执行备份（可自定义提交信息）
+  ip          显示服务器IP地址
+  console     进入服务器控制台（附加到容器）
+  update      更新服务器（重新构建镜像）
+  clean       清理未使用的Docker资源
+  help        显示此帮助信息
+
+选项:
+  -v, --verbose   显示详细输出
+  -h, --help      显示帮助信息
+
+示例:
+  ${SCRIPT_NAME} start                    # 启动服务器
+  ${SCRIPT_NAME} restart                  # 重启服务器
+  ${SCRIPT_NAME} logs -f                  # 查看实时日志
+  ${SCRIPT_NAME} backup                   # 手动执行备份（默认信息）
+  ${SCRIPT_NAME} backup "服务器维护前"     # 自定义备份信息
+  ${SCRIPT_NAME} backup ""                # 只显示时间，无自定义文本
+
+EOF
+}
+
+# 检查Docker环境
+check_docker() {
+    log_debug "检查Docker环境..."
+    
+    if ! command -v docker &> /dev/null; then
+        log_error "Docker未安装，请先安装Docker"
+        log_info "安装指南: https://docs.docker.com/get-docker/"
+        exit 1
+    fi
+
+    if docker compose version &> /dev/null; then
+        COMPOSE_CMD="docker compose"
+    elif command -v docker-compose &> /dev/null; then
+        COMPOSE_CMD="docker-compose"
+    else
+        log_error "Docker Compose未安装"
+        exit 1
+    fi
+    
+    log_debug "使用命令: $COMPOSE_CMD"
+    log_info "Docker环境检查通过"
+}
+
+# 检查并释放端口
+release_port() {
+    log_info "检查端口 ${SERVER_PORT} 占用情况..."
+    
+    local pids=$(lsof -ti:${SERVER_PORT} 2>/dev/null || ss -tlnp 2>/dev/null | grep ":${SERVER_PORT}" | awk '{print $7}' | cut -d'=' -f2 | cut -d',' -f1 | grep -o '[0-9]*')
+    
+    if [ -n "$pids" ]; then
+        log_warn "发现端口被占用，进程ID: $pids"
+        
+        # 检查是否是Docker容器
+        local containers=$(docker ps -q --filter "publish=${SERVER_PORT}" 2>/dev/null)
+        if [ -n "$containers" ]; then
+            log_info "停止占用端口的容器..."
+            docker stop $containers &>/dev/null || true
+            docker rm $containers &>/dev/null || true
+        fi
+        
+        # 终止其他进程
+        for pid in $pids; do
+            if kill -0 "$pid" 2>/dev/null; then
+                log_warn "终止进程 $pid..."
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        done
+        
+        sleep 2
+        
+        if lsof -ti:${SERVER_PORT} &>/dev/null; then
+            log_error "无法释放端口 ${SERVER_PORT}"
+            exit 1
+        else
+            log_info "端口已释放"
+        fi
+    else
+        log_info "端口未被占用"
+    fi
+}
+
+# 显示IP地址
+show_ip_addresses() {
+    log_highlight "╔════════════════════════════════════════════════════════╗"
+    log_highlight "║              服务器连接信息                            ║"
+    log_highlight "╚════════════════════════════════════════════════════════╝"
+    echo ""
+    
+    # IPv4
+    echo -e "${CYAN}【IPv4 地址】${NC}"
+    local ipv4=$(ip -4 addr show 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -5)
+    if [ -n "$ipv4" ]; then
+        while IFS= read -r addr; do
+            echo -e "  ${GREEN}➜${NC} $addr:${SERVER_PORT}"
+        done <<< "$ipv4"
+    else
+        echo -e "  ${YELLOW}未找到IPv4地址${NC}"
+    fi
+    echo ""
+    
+    # IPv6
+    echo -e "${CYAN}【IPv6 地址】${NC}"
+    local ipv6=$(ip -6 addr show 2>/dev/null | grep -oP '(?<=inet6\s)[0-9a-fA-F:]+' | grep -v '^::1$' | grep -v '^fe80' | head -5)
+    if [ -n "$ipv6" ]; then
+        while IFS= read -r addr; do
+            echo -e "  ${GREEN}➜${NC} [$addr]:${SERVER_PORT}"
+        done <<< "$ipv6"
+    else
+        echo -e "  ${YELLOW}未找到公网IPv6地址${NC}"
+    fi
+    echo ""
+    
+    # 本地连接
+    echo -e "${CYAN}【本地连接】${NC}"
+    echo -e "  ${GREEN}➜${NC} localhost:${SERVER_PORT}"
+    echo -e "  ${GREEN}➜${NC} 127.0.0.1:${SERVER_PORT}"
+    echo ""
+}
+
+# 准备数据目录
+prepare_data() {
+    log_debug "准备数据目录..."
+    
+    if [ ! -d "$DATA_DIR" ]; then
+        mkdir -p "$DATA_DIR"
+        log_info "创建数据目录: $DATA_DIR"
+    fi
+    
+    # 下载服务端
+    local paper_url="https://fill-data.papermc.io/v1/objects/da497e12b43e5b61c5df150e4bfd0de0f53043e57d2ac98dd59289ee9da4ad68/paper-1.21.11-127.jar"
+    
+    if [ ! -f "$DATA_DIR/paper.jar" ]; then
+        log_info "下载PaperMC服务端..."
+        if wget -q --show-progress -O "$DATA_DIR/paper.jar" "$paper_url"; then
+            log_info "下载完成"
+        else
+            log_error "下载失败"
+            exit 1
+        fi
+    else
+        log_debug "服务端已存在"
+    fi
+    
+    # EULA
+    if [ ! -f "$DATA_DIR/eula.txt" ]; then
+        echo "eula=true" > "$DATA_DIR/eula.txt"
+        log_info "已接受EULA"
+    fi
+}
+
+# 启动服务器
+cmd_start() {
+    log_info "启动Minecraft服务器..."
+    check_docker
+    release_port
+    prepare_data
+    
+    cd "$SCRIPT_DIR"
+    $COMPOSE_CMD -f "$COMPOSE_FILE" up -d --build
+    
+    if [ $? -eq 0 ]; then
+        log_info "服务器启动成功！"
+        echo ""
+        show_ip_addresses
+        setup_cron
+        show_status
+    else
+        log_error "启动失败"
+        exit 1
+    fi
+}
+
+# 停止服务器
+cmd_stop() {
+    log_info "停止Minecraft服务器..."
+    check_docker
+    
+    cd "$SCRIPT_DIR"
+    $COMPOSE_CMD -f "$COMPOSE_FILE" down
+    
+    if [ $? -eq 0 ]; then
+        log_info "服务器已停止"
+    fi
+}
+
+# 重启服务器
+cmd_restart() {
+    cmd_stop
+    sleep 2
+    cmd_start
+}
+
+# 查看状态
+cmd_status() {
+    check_docker
+    
+    if docker ps | grep -q "$SERVER_NAME"; then
+        log_info "服务器运行中"
+        docker ps --filter "name=$SERVER_NAME" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+    else
+        log_warn "服务器未运行"
+    fi
+}
+
+# 查看日志
+cmd_logs() {
+    check_docker
+    log_info "显示日志 (按 Ctrl+C 退出)..."
+    cd "$SCRIPT_DIR"
+    $COMPOSE_CMD -f "$COMPOSE_FILE" logs -f
+}
+
+# 进入控制台
+cmd_console() {
+    check_docker
+    log_info "进入服务器控制台 (按 Ctrl+P, Ctrl+Q 退出)..."
+    docker attach "$SERVER_NAME"
+}
+
+# 备份
+cmd_backup() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local time_min=$(date '+%Y-%m-%d %H:%M')
+    local custom_msg="${1:-自动备份}"
+    
+    log_info "[$timestamp] 开始备份..."
+    
+    cd "$SCRIPT_DIR"
+    
+    if [ -z "$(git status --porcelain 2>/dev/null)" ]; then
+        log_info "没有变更，跳过备份"
+        return 0
+    fi
+    
+    git add -A
+    
+    # 构建提交信息: 时间 + 自定义文本
+    local commit_msg="${time_min} ${custom_msg}"
+    
+    if git commit -m "$commit_msg"; then
+        # 使用原用户推送
+        if [ -n "$SUDO_USER" ]; then
+            sudo -u "$SUDO_USER" -H git push origin master
+        else
+            git push origin master
+        fi
+        
+        if [ $? -eq 0 ]; then
+            log_info "[$timestamp] 备份推送成功"
+        else
+            log_error "[$timestamp] 推送失败"
+        fi
+    fi
+}
+
+# 设置定时任务
+setup_cron() {
+    log_debug "设置定时备份..."
+    
+    local script_path="$(realpath "$0")"
+    local cron_job="0 0 * * * cd $SCRIPT_DIR && bash $script_path backup"
+    
+    if ! crontab -l 2>/dev/null | grep -q "$script_path backup"; then
+        (crontab -l 2>/dev/null; echo "$cron_job") | crontab -
+        log_info "已设置每日0点自动备份"
+    fi
+}
+
+# 更新服务器
+cmd_update() {
+    log_info "更新服务器..."
+    check_docker
+    
+    cd "$SCRIPT_DIR"
+    $COMPOSE_CMD -f "$COMPOSE_FILE" build --no-cache
+    cmd_restart
+}
+
+# 清理资源
+cmd_clean() {
+    log_info "清理Docker资源..."
+    docker system prune -f
+    docker volume prune -f
+}
+
+# 主函数
+main() {
+    cd "$SCRIPT_DIR"
+    
+    # 解析选项
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -*)
+                log_error "未知选项: $1"
+                show_help
+                exit 1
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    
+    # 执行命令
+    case "${1:-start}" in
+        start)      cmd_start ;;
+        stop)       cmd_stop ;;
+        restart)    cmd_restart ;;
+        status)     cmd_status ;;
+        logs)       cmd_logs ;;
+        console)    cmd_console ;;
+        backup)
+            shift
+            cmd_backup "$*"
+            ;;
+        ip)         show_ip_addresses ;;
+        update)     cmd_update ;;
+        clean)      cmd_clean ;;
+        help)       show_help ;;
+        *)
+            log_error "未知命令: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
