@@ -130,10 +130,10 @@ spark:
   enable-immediately: false
   enabled: true
 unsupported-settings:
-  allow-headless-pistons: false
-  allow-permanent-block-break-exploits: false
-  allow-piston-duplication: false
-  allow-unsafe-end-portal-teleportation: false
+  allow-headless-pistons: true
+  allow-permanent-block-break-exploits: true
+  allow-piston-duplication: true
+  allow-unsafe-end-portal-teleportation: true
   compression-format: ZLIB
   oversized-item-component-sanitizer:
     dont-sanitize: []
